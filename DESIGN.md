@@ -56,9 +56,9 @@ Request:
 { "workspace": "test-junkyard", "command": "hostname && pwd", "timeout_secs": 300 }
 ```
 - `timeout_secs` optional, default 300, max 600 (configurable).
-- The command is executed as `coder ssh <workspace> -- <command>` — no PTY,
-  stdout/stderr piped, exit code captured. On timeout the process group is
-  killed and partial output is returned.
+- The command is executed as `coder ssh <workspace> -- <command>`, with
+  output piped and exit code captured (see the PTY caveat below). On timeout
+  the process tree is killed and partial output is returned.
 
 Response:
 ```json
@@ -73,6 +73,23 @@ Response:
   allowlist, `401` for bad/missing bearer token, `408` on timeout (with
   partial output included).
 
+**Build-time finding:** `coder ssh` always allocates a PTY for the remote
+command (no flag to disable it in v2.33.2), which has two consequences:
+- The remote command's stdout and stderr arrive merged on our local stdout.
+  `stdout` in the response is that merged stream; `stderr` is reserved for
+  `coder`-CLI-level diagnostics (connection failure, workspace unreachable),
+  not the remote command's stderr.
+- A nonzero remote exit code isn't `coder ssh`'s own exit code (that's always
+  1 on any remote failure) — it's recovered by regexing `coder`'s own error
+  text (`Process exited with status N`) off local stderr. If that pattern
+  isn't found on a nonzero exit, it's a CLI-level failure, not a completed
+  exec, and the proxy returns `502` instead of a fake exit code.
+
+Going through `coder ssh --stdio` with a raw SSH client would give true
+stream separation and a trustworthy exit code, but adds a third-party SSH
+dependency and real complexity for a v1 tool whose non-goals already rule
+out PTY/interactive sessions. Deferred unless demonstrated need.
+
 ## Trust boundary and scoping
 
 - **Bearer token** for client auth. Tailnet membership alone is not
@@ -85,38 +102,66 @@ Response:
   workspaces; the blast radius is bounded by the allowlist, not by second-
   guessing commands.
 - **Audit log**: append-only, one JSON object per line per call —
-  timestamp, workspace, command, exit_code, duration_secs, and truncated
-  stdout/stderr (or a hash if full output is too noisy; decide at build
-  time). This log is the audit trail and must not be optional.
-- **Output caps**: truncate stdout/stderr (suggest 64KB combined, head+tail
-  with a marker) so a runaway log can't flood the caller.
+  timestamp, remote_addr, method, path, status_code, and (for `/exec`)
+  workspace, command, exit_code, duration_secs, truncated, and stdout/stderr
+  truncated to 4KB each. Truncated text, not a hash — a hash isn't reviewable
+  by a human later, and 4KB per call keeps the log both readable and bounded.
+  This log is the audit trail and must not be optional.
+- **Output caps**: truncate stdout/stderr, independently, at `max_output_bytes`
+  each (default 64KB) — not the combined-stream head+tail style originally
+  suggested. Combining two concurrently-read pipes into one true head+tail
+  view adds real complexity for a v1 tool; a plain per-stream cutoff is both
+  simpler and defends against the same runaway-output case. Revisit only on
+  demonstrated need.
 
 ## Configuration
 
-Env vars or a small TOML file (decide at build time):
-- `LISTEN_ADDR` (default `100.99.196.68`), `PORT` (default `8090`)
-- `BEARER_TOKEN`
-- `CODER_URL` (default `http://127.0.0.1:7080`), `CODER_SESSION_TOKEN`
-- `WORKSPACE_ALLOWLIST` (comma-separated)
-- `AUDIT_LOG_PATH`, `DEFAULT_TIMEOUT_SECS`, `MAX_OUTPUT_BYTES`
+TOML file for structure, environment variables for secrets only
+(`config.toml`, gitignored; template in `config.example.toml`):
+- `listen_addr` (default `100.99.196.68`), `port` (default `8090`)
+- `coder_url` (default `http://127.0.0.1:7080`)
+- `workspace_allowlist` (list)
+- `trusted_cidr` (default `100.64.0.0/10`)
+- `audit_log_path`, `default_timeout_secs`, `max_timeout_secs`, `max_output_bytes`
+- Secrets, env vars only, never written to a file: `MUSE_PROXY_BEARER_TOKEN`,
+  `MUSE_CODER_TOKEN` (named distinctly from an interactive user's own
+  `CODER_SESSION_TOKEN` so the two are never accidentally conflated).
 
 ## Operational notes (Windows)
 
-- Python with minimal dependencies (stdlib preferred; one micro-framework at
-  most). This will be built and iterated on Stablebeast itself via Claude
-  Code, so Windows-native behavior (subprocess, paths, quoting) must be
-  tested there, not assumed.
-- v1 runs as a console script started by hand. Service-ifying (NSSM /
-  scheduled task) is a later step, not v1.
-- The `coder` CLI must be on PATH for the proxy process, with
-  `CODER_URL`/`CODER_SESSION_TOKEN` available to it.
+- Built in pure Python 3.13 stdlib — `http.server.ThreadingHTTPServer`, no
+  micro-framework. Three routes and one trusted client don't justify a web
+  framework dependency on a hand-started Windows console script.
+  Built and tested directly on Stablebeast, so Windows-native behavior
+  (subprocess, paths, quoting) was verified there, not assumed. In
+  particular, Windows has no POSIX process groups: exec launches with
+  `CREATE_NEW_PROCESS_GROUP` and a timeout kill uses `taskkill /PID <pid> /T
+  /F` (tree-kill) rather than `Popen.terminate()`.
+- v1 starts automatically at Windows login via a stub in the Startup folder
+  (`%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\muse-coder-proxy.cmd`,
+  copied from `scripts/muse-coder-proxy.cmd`) calling `scripts/start-proxy.ps1`,
+  which is idempotent (won't start a second copy if one's already running) and
+  logs to `logs/`. Not a Windows Service - no auto-restart on crash, no
+  `services.msc` visibility. Service-ifying (NSSM / scheduled task) is a
+  later step if that's ever needed.
+- The `coder` CLI must be on PATH for the proxy process; it's invoked with
+  `CODER_URL`/`CODER_SESSION_TOKEN` set from the proxy's own config/env
+  (`coder_url` / `MUSE_CODER_TOKEN`), not inherited from the launching shell.
 
 ## Coder token for the proxy
 
 The proxy needs a Coder token with exec access to the allowlisted workspaces.
-Simplest v1: reuse an existing token with that access. If Coder's permission
-model makes a dedicated least-privilege token easy, prefer that. Decide at
-build time; don't gold-plate.
+
+**Build-time finding:** Coder v2.33.2 supports resource-scoped tokens
+(`coder tokens create --allow workspace:<uuid>`), which looked like an easy
+least-privilege win. Tested and rejected: a token scoped this way was denied
+`coder ssh` even against its own allowed workspace, and `coder list` under it
+hit a server-side SQL error (`column reference "id" is ambiguous`) — a bug in
+this version's scoping, not something to build a security boundary on. v1
+uses a dedicated full-access token instead (env var `MUSE_CODER_TOKEN`,
+distinct from any interactive user's own `CODER_SESSION_TOKEN`), with the
+allowlist as the only real boundary. Revisit `--allow` scoping if a future
+Coder version fixes it.
 
 ## Acceptance — the live test
 
@@ -129,9 +174,17 @@ From Bert's VM, over the tailnet:
 5. Negative checks: exec on a non-allowlisted workspace → refused; wrong
    bearer token → 401.
 
+**Verified 2026-09-26**, run locally on Stablebeast against the real tailnet
+IP (100.99.196.68:8090) and the real `test-junkyard` workspace — not yet run
+from Bert's VM itself, since that requires Bert's operator to have the
+proxy's bearer token. All five checks passed, including the audit log
+capturing every call (auth failures, the successful exec, and the allowlist
+rejection) with accurate timestamps and source addresses.
+
 ## Open questions (not blockers)
 
-- Exact output-cap size and truncation style.
 - Whether persistent shell sessions are ever needed (one-shot covers the
   known use cases; add only on demonstrated need).
-- Windows service vs manual start for the long term.
+- Whether a real Windows Service (NSSM or similar) is ever needed for
+  auto-restart-on-crash - the Startup-folder launcher covers "runs at
+  login" but not "comes back if it dies mid-session."
