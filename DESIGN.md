@@ -144,6 +144,11 @@ TOML file for structure, environment variables for secrets only
   logs to `logs/`. Not a Windows Service - no auto-restart on crash, no
   `services.msc` visibility. Service-ifying (NSSM / scheduled task) is a
   later step if that's ever needed.
+- `config.toml` is read once at startup. After editing it (e.g. to change the
+  allowlist), run `scripts\restart-proxy.ps1`: it stops the running proxy,
+  re-runs the launcher, and prints the new startup log (including the
+  allowlist in effect). It aborts without stopping anything if the `MUSE_*`
+  secrets are missing from the calling shell. An in-flight `/exec` is dropped.
 - The `coder` CLI must be on PATH for the proxy process; it's invoked with
   `CODER_URL`/`CODER_SESSION_TOKEN` set from the proxy's own config/env
   (`coder_url` / `MUSE_CODER_TOKEN`), not inherited from the launching shell.
