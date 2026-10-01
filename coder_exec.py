@@ -130,9 +130,14 @@ def exec_command(
         kwargs["creationflags"] = _CREATE_NEW_PROCESS_GROUP
 
     start = time.monotonic()
+    # NB: stdin must be DEVNULL, not inherited. `coder ssh` keeps the session
+    # open reading stdin after the remote command finishes; when the proxy
+    # runs headless (Startup folder, no console) the inherited stdin never
+    # yields, so the child never exits and exec hangs until the timeout.
     proc = subprocess.Popen(
         args,
         env=_env(coder_url, coder_token),
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         **kwargs,
